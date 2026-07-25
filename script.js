@@ -1,15 +1,11 @@
 /**
- * Frida hook script for libAkAudioVisiual.so
- * Logs: server URL (plaintext), request/response data (decrypted), DES operations
- * 
- * Usage: frida -U -l hook_log.js <package_name>
- *    or:  frida -U -f <package_name> -l hook_log.js --no-pause
+ * Frida hook script for libAkAudioVisiual.so v2
+ * Fixes: CURLOPT_URL=0x2712, wide-char key, captures all curl opts
  */
 
 var libName = "libAkAudioVisiual.so";
 var base = null;
 
-// Wait for the library to load
 function waitForLib(name, cb) {
     var found = false;
     var check = function () {
@@ -20,229 +16,213 @@ function waitForLib(name, cb) {
             cb(m.base);
         }
     };
-    // Check immediately
     check();
-    // Also poll
     var interval = setInterval(function () {
-        if (found) {
-            clearInterval(interval);
-            return;
-        }
+        if (found) { clearInterval(interval); return; }
         check();
     }, 100);
 }
 
-// =========================================================
-// OFFSETS (add base address at runtime)
-// =========================================================
 var OFFSETS = {
-    // curl / URL
-    curl_easy_setopt_wrapper: 0xedff0,
-    CURLOPT_URL: 0x27fe, // 10238
-
-    // SSL (plaintext request/response)
-    SSL_read:  0x135c40,
-    SSL_write: 0x135f64,
-    SSL_connect: 0x138b8c,
-
-    // DES decryption
+    curl_setopt_wrapper: 0xedff0,
+    CURLOPT_URL:         0x2712,
+    CURLOPT_WRITEDATA:   0x2711,
+    CURLOPT_WRITEFUNCTION: 0x4e2b,
+    SSL_read:             0x135c40,
+    SSL_write:            0x135f64,
+    SSL_connect:          0x138b8c,
+    DES_ecb_encrypt:      0x17d3c4,
     DES_set_key_unchecked: 0x17d700,
-    DES_ecb_encrypt: 0x17d3c4,
-
-    // Strings in .rodata
-    str_https: 0x2ae853,
-    str_key:   0x2ae831,
 };
-
-// =========================================================
-// Helpers
-// =========================================================
-var MAX_DUMP = 4096;
 
 function hexdump_safe(ptr, len) {
     try {
-        var n = Math.min(len, MAX_DUMP);
-        return hexdump(ptr, { offset: 0, length: n, header: true, ansi: true });
-    } catch (e) {
-        return "(read error: " + e + ")";
-    }
+        return hexdump(ptr, { offset: 0, length: Math.min(len, 4096), header: true, ansi: false });
+    } catch (e) { return "(err)"; }
 }
 
 function tryReadCString(ptr) {
-    try {
-        if (ptr.isNull()) return "(null)";
-        var s = ptr.readCString();
-        return s ? s : "(empty)";
-    } catch (e) {
-        return "(error: " + e + ")";
-    }
+    try { if (ptr.isNull()) return "(null)"; var s = ptr.readCString(); return s || "(empty)"; }
+    catch (e) { return "(err)"; }
 }
 
-// Track DES keys
-var desKeys = {};
-var sslConnections = {};
+function tryReadWideString(ptr, maxlen) {
+    // Read wide-char (UTF-16) string: char, 0x00, char, 0x00, ...
+    try {
+        var out = "";
+        for (var i = 0; i < (maxlen || 64); i++) {
+            var b0 = ptr.add(i * 2).readU8();
+            var b1 = ptr.add(i * 2 + 1).readU8();
+            if (b0 === 0 && b1 === 0) break;
+            if (b1 === 0) out += String.fromCharCode(b0);
+            else out += "?";
+        }
+        return out || "(empty)";
+    } catch (e) { return "(err)"; }
+}
 
-// =========================================================
-// HOOKS
-// =========================================================
+var desKeys = {};
+var curlOptions = {};
+
+// ----- Known CURLOPT names -----
+var CURLOPT_NAMES = {
+    0x2712: "URL",
+    0x2711: "WRITEDATA",
+    0x4e2b: "WRITEFUNCTION",
+    0x002b: "VERBOSE",
+    0x0040: "SSL_VERIFYPEER",
+    0x0051: "SSL_VERIFYHOST",
+    0x2713: "PROXY",
+    0x002d: "FOLLOWLOCATION",
+    0x0e28: "POSTFIELDS",
+    0x2714: "CUSTOMREQUEST",
+    0x2710: "HTTPHEADER",
+    0x00c9: "TIMEOUT",
+};
+
 waitForLib(libName, function (baseAddr) {
     base = baseAddr;
-    console.log("[+] Base address: " + base);
+    console.log("[+] Base: " + base + "\n");
 
-    // --- 1. curl_easy_setopt wrapper -> log CURLOPT_URL ---
-    var setoptAddr = base.add(OFFSETS.curl_easy_setopt_wrapper);
-    console.log("[*] Hooking curl_easy_setopt wrapper at " + setoptAddr);
-
-    Interceptor.attach(setoptAddr, {
+    // --- 1. Curl setopt: log ALL options ---
+    var setopt = base.add(OFFSETS.curl_setopt_wrapper);
+    Interceptor.attach(setopt, {
         onEnter: function (args) {
-            this.option = args[1].toInt32();
-            this.value = args[2];
+            var opt = args[1].toInt32();
+            var val = args[2];
+            var name = CURLOPT_NAMES[opt] || ("0x" + opt.toString(16));
 
-            if (this.option === OFFSETS.CURLOPT_URL) {
-                console.log("\n[CURLOPT_URL] " + tryReadCString(this.value));
-            } else if (this.option === 0x2711) { // CURLOPT_WRITEDATA
-                // could log but noisy
-            } else if (this.option === 0x4e2b) { // CURLOPT_WRITEFUNCTION
-                console.log("[CURLOPT_WRITEFUNCTION] callback = " + this.value);
-            }
+            if (opt === OFFSETS.CURLOPT_URL) {
+                console.log("========================================");
+                console.log("[CURLOPT_URL] " + tryReadCString(val));
+                console.log("========================================");
+            } else if (opt === OFFSETS.CURLOPT_CUSTOMREQUEST || 
+                       opt === OFFSETS.CURLOPT_POSTFIELDS) {
+                console.log("[CURLOPT_" + name + "] " + tryReadCString(val));
+            } else if (opt === OFFSETS.CURLOPT_HTTPHEADER) {
+                console.log("[CURLOPT_HTTPHEADER] ptr=" + val);
+                // chain through the curl_slist
+                try {
+                    var node = val;
+                    var i = 0;
+                    while (!node.isNull() && i < 20) {
+                        var data = node.readPointer();
+                        if (!data.isNull()) {
+                            console.log("  header[" + i + "]: " + tryReadCString(data));
+                        }
+                        node = node.add(Process.pointerSize);
+                        i++;
+                    }
+                } catch (e) { }
+            } else if (opt === OFFSETS.CURLOPT_WRITEFUNCTION) {
+                console.log("[CURLOPT_WRITEFUNCTION] cb=" + val + " name=" + DebugSymbol.fromAddress(val));
+            } else if (opt === OFFSETS.CURLOPT_WRITEDATA) {
+                console.log("[CURLOPT_WRITEDATA] ptr=" + val);
+            } else if (opt === OFFSETS.CURLOPT_SSL_VERIFYPEER || 
+                       opt === OFFSETS.CURLOPT_SSL_VERIFYHOST) {
+                console.log("[CURLOPT_" + name + "] " + val);
+            } 
         },
     });
 
-    // --- 2. SSL_read -> log decrypted server response ---
-    var sslReadAddr = base.add(OFFSETS.SSL_read);
-    console.log("[*] Hooking SSL_read at " + sslReadAddr);
-
-    Interceptor.attach(sslReadAddr, {
+    // --- 2. SSL_read: decrypted server response ---
+    var sslRead = base.add(OFFSETS.SSL_read);
+    Interceptor.attach(sslRead, {
         onEnter: function (args) {
-            this.ssl = args[0];
             this.buf = args[1];
             this.len = args[2].toInt32();
         },
         onLeave: function (retval) {
             var n = retval.toInt32();
             if (n > 0 && n < 65536) {
-                console.log("\n[SSL_read]  len=" + this.len + " returned=" + n);
+                console.log("\n[SSL_read] " + n + " bytes (response)");
                 console.log(hexdump_safe(this.buf, n));
-                // Try as text
                 try {
-                    var txt = this.buf.readUtf8String(Math.min(n, 2000));
-                    if (txt && txt.length > 1) {
-                        console.log("[SSL_read TEXT]\n" + txt.substring(0, 1000));
-                    }
+                    var txt = this.buf.readUtf8String(Math.min(n, 3000));
+                    console.log("[TEXT]\n" + txt.substring(0, 2000));
                 } catch (e) { }
-            } else if (n < 0) {
-                console.log("[SSL_read]  ERROR code=" + n);
+                console.log("");
             }
         },
     });
 
-    // --- 3. SSL_write -> log decrypted request ---
-    var sslWriteAddr = base.add(OFFSETS.SSL_write);
-    console.log("[*] Hooking SSL_write at " + sslWriteAddr);
-
-    Interceptor.attach(sslWriteAddr, {
+    // --- 3. SSL_write: decrypted request ---
+    var sslWrite = base.add(OFFSETS.SSL_write);
+    Interceptor.attach(sslWrite, {
         onEnter: function (args) {
-            this.ssl = args[0];
             this.buf = args[1];
             this.len = args[2].toInt32();
         },
         onLeave: function (retval) {
             var n = retval.toInt32();
             if (n > 0 && n < 65536) {
-                console.log("\n[SSL_write] len=" + this.len + " sent=" + n);
+                console.log("\n[SSL_write] " + n + " bytes (request)");
                 console.log(hexdump_safe(this.buf, n));
-                // Try as text
                 try {
-                    var txt = this.buf.readUtf8String(Math.min(n, 2000));
-                    if (txt && txt.length > 1) {
-                        console.log("[SSL_write TEXT]\n" + txt.substring(0, 1000));
-                    }
+                    var txt = this.buf.readUtf8String(Math.min(n, 3000));
+                    console.log("[TEXT]\n" + txt.substring(0, 2000));
                 } catch (e) { }
+                console.log("");
             }
         },
     });
 
-    // --- 4. SSL_connect -> log when TLS handshake starts ---
-    var sslConnectAddr = base.add(OFFSETS.SSL_connect);
-    console.log("[*] Hooking SSL_connect at " + sslConnectAddr);
-
-    Interceptor.attach(sslConnectAddr, {
+    // --- 4. SSL_connect ---
+    var sslConn = base.add(OFFSETS.SSL_connect);
+    Interceptor.attach(sslConn, {
         onEnter: function (args) {
-            console.log("\n[SSL_connect] starting TLS handshake, ssl=" + args[0]);
-        },
-        onLeave: function (retval) {
-            console.log("[SSL_connect] result=" + retval);
+            console.log("\n[SSL_connect] establishing TLS...");
         },
     });
 
-    // --- 5. DES_set_key -> log encryption keys ---
-    var desSetKeyAddr = base.add(OFFSETS.DES_set_key_unchecked);
-    console.log("[*] Hooking DES_set_key_unchecked at " + desSetKeyAddr);
-
-    Interceptor.attach(desSetKeyAddr, {
-        onEnter: function (args) {
-            this.key = args[0];
-            this.sched = args[1];
-        },
-        onLeave: function (retval) {
-            try {
-                var keyBytes = this.key.readByteArray(8);
-                var keyHex = "";
-                var keyArr = new Uint8Array(keyBytes);
-                for (var i = 0; i < 8; i++) {
-                    keyHex += ("0" + keyArr[i].toString(16)).slice(-2);
-                }
-                console.log("[DES_set_key] key=" + keyHex + " schedule=" + this.sched);
-                desKeys[this.sched.toString()] = keyHex;
-            } catch (e) { }
-        },
-    });
-
-    // --- 6. DES_ecb_encrypt -> log encrypted/decrypted blocks ---
-    var desEncAddr = base.add(OFFSETS.DES_ecb_encrypt);
-    console.log("[*] Hooking DES_ecb_encrypt at " + desEncAddr);
-
+    // --- 5. DES decrypt ---
+    var desEnc = base.add(OFFSETS.DES_ecb_encrypt);
     var desCount = 0;
-    Interceptor.attach(desEncAddr, {
+    Interceptor.attach(desEnc, {
         onEnter: function (args) {
             this.input = args[0];
             this.output = args[1];
             this.sched = args[2];
-            this.enc = args[3].toInt32(); // 0=decrypt, 1=encrypt
+            this.enc = args[3].toInt32();
         },
         onLeave: function (retval) {
             desCount++;
-            var dir = this.enc === 1 ? "ENCRYPT" : "DECRYPT";
-            var keyHint = desKeys[this.sched.toString()] || "unknown";
-            console.log("\n[DES_ecb_encrypt #" + desCount + "] " + dir + "  key=" + keyHint);
-
+            var dir = this.enc === 1 ? "ENC" : "DEC";
+            var keyHint = desKeys[this.sched.toString()] || "?";
+            console.log("[DES_ecb #" + desCount + "] " + dir + " key=" + keyHint);
             if (this.enc === 0) {
-                // Decrypt: show output (plaintext)
-                console.log("[DES_decrypt OUTPUT (plaintext):]");
                 console.log(hexdump_safe(this.output, 8));
-                try {
-                    var txt = this.output.readUtf8String(8);
-                    console.log("[DES_decrypt TEXT]: " + txt);
-                } catch (e) { }
+                try { console.log("[TXT] " + this.output.readCString(8)); } catch(e) {}
             } else {
-                // Encrypt: show input (plaintext before encryption)
-                console.log("[DES_encrypt INPUT (plaintext):]");
                 console.log(hexdump_safe(this.input, 8));
-                try {
-                    var txt = this.input.readUtf8String(8);
-                    console.log("[DES_encrypt TEXT]: " + txt);
-                } catch (e) { }
+                try { console.log("[TXT] " + this.input.readCString(8)); } catch(e) {}
             }
+            console.log("");
         },
     });
 
-    // --- 7. Dump the .rodata strings ---
-    console.log("\n[*] Dumping key strings from .rodata:");
-    console.log("    https  = " + tryReadCString(base.add(OFFSETS.str_https)));
-    console.log("    sad    = " + tryReadCString(base.add(OFFSETS.str_https + 6)));
-    console.log("    sad1   = " + tryReadCString(base.add(OFFSETS.str_https + 10)));
-    console.log("    sad2   = " + tryReadCString(base.add(OFFSETS.str_https + 15)));
-    console.log("    key    = " + tryReadCString(base.add(OFFSETS.str_key)));
-    console.log("    cmdline= " + tryReadCString(base.add(0x2ae7b0)));
-    console.log("[+] All hooks ready. Waiting for activity...\n");
+    // --- 6. DES keys ---
+    var desKey = base.add(OFFSETS.DES_set_key_unchecked);
+    Interceptor.attach(desKey, {
+        onEnter: function (args) { this.kptr = args[0]; },
+        onLeave: function (retval) {
+            try {
+                var kb = this.kptr.readByteArray(8);
+                var kh = Array.from(new Uint8Array(kb)).map(b => ("0"+b.toString(16)).slice(-2)).join("");
+                console.log("[DES_KEY] " + kh);
+            } catch(e) {}
+        },
+    });
+
+    // --- Dump strings ---
+    console.log("=== .rodata strings ===");
+    console.log("https   = " + tryReadCString(base.add(0x2ae853)));
+    console.log("sad     = " + tryReadCString(base.add(0x2ae859)));
+    console.log("sad1    = " + tryReadCString(base.add(0x2ae85d)));
+    console.log("sad2    = " + tryReadCString(base.add(0x2ae862)));
+    console.log("key (wide) = " + tryReadWideString(base.add(0x2ae831), 20));
+    console.log("pkg     = " + tryReadCString(base.add(0x2ae7c3)));
+    console.log("Mod msg = " + tryReadCString(base.add(0x2ae881)).substring(0, 60));
+    console.log("========================\n");
+    console.log("[+] All hooks active.\n");
 });
